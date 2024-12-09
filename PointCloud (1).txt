@@ -1,0 +1,1748 @@
+import carb
+# Python built-in
+import argparse
+import inspect
+import math
+import os
+import sys
+import threading
+import time
+import omni.replicator.core as rep
+from omni.isaac.sensor import IMUSensor
+import numpy as np
+import omni.timeline
+
+import logging
+
+#shamil
+import socket
+import struct
+import select
+import time
+import threading
+from enum import Enum
+import sys
+from select import poll, POLLIN
+
+from omni.kit.scripting import BehaviorScript
+
+
+g_connection_status_subscription = None
+g_stage_merged = False
+
+#shamil
+# Define Livox Mid360 specific ports
+broadcast_port = 56000  # Broadcast port for device type query
+ctrl_cmd_port_device = 56100  # Command port for all operations
+ctrl_cmd_port_host = 56101  # Command port for all operations
+push_cmd_port_device = 56200  # Push data
+push_cmd_port_host = 56201  # Push Data
+point_data_port_device = 56300  # Point Cloud Data
+point_data_port_host = 56301  # Point Cloud Data
+imu_data_port_device = 56400  # IMU Data
+imu_data_port_host = 56401  # IMU Data
+log_data_port_device = 56500  # LOG Data
+log_data_port_host = 56501  # LOG Data
+
+MAXLEN = 1400
+MAX_SOCKETS = 20
+POINTCLOUDDATAMAX = 96
+
+LIDAR_HOST_IP = "172.20.10.2"     # Target IP UDP
+LIDAR_DEVICE_IP = "172.20.10.3"    # Isac sim IP for sending UDP point cloud.
+LIDAR_DEVICE_SN = "Tux-LivoxLidar1"
+LIDAR_DEVICE_MASK = "255.255.255.0"
+LIDAR_DEVICE_GATEWAY = "192.168.255.1"
+
+IMU_TARGET_HZ = 200
+IMU_TARGET_DELTA_TIME = 1.0 / IMU_TARGET_HZ
+
+POINTCLOUD_TARGET_HZ = 30     # It should always greater than current fps 
+POINTCLOUD_TARGET_DELTA_TIME = 1.0 / POINTCLOUD_TARGET_HZ
+
+
+DEVICE_MAC = (0x7c, 0x7a, 0x91, 0x33, 0xbe, 0x3b)
+
+pcl_sockfd = None
+imu_sockfd = None
+buffer = bytearray()
+buffer2 = bytearray()
+seq_num = 0
+seq_num1 = 0
+pcl_host_socket = None
+imu_host_socket = None
+pcl_file = None
+frame_cnt = 0
+
+class LivoxLidarInfo:
+    fmt = 'B16s16s'  # Define the format string for struct packing/unpacking
+
+    def __init__(self, dev_type, sn, lidar_ip):
+        self.dev_type = dev_type
+        self.sn = sn
+        self.lidar_ip = lidar_ip
+
+    def pack(self):
+        return struct.pack(self.fmt, self.dev_type, self.sn.encode('utf-8'), self.lidar_ip.encode('utf-8'))
+
+    @classmethod
+    def unpack(cls, data):
+        dev_type, sn, lidar_ip = struct.unpack(cls.fmt, data)
+        return cls(dev_type, sn.decode('utf-8').strip('\x00'), lidar_ip.decode('utf-8').strip('\x00'))
+
+
+class LivoxLidarDeviceType(Enum):
+    kLivoxLidarTypeHub = 0
+    kLivoxLidarTypeMid40 = 1
+    kLivoxLidarTypeTele = 2
+    kLivoxLidarTypeHorizon = 3
+    kLivoxLidarTypeMid70 = 6
+    kLivoxLidarTypeAvia = 7
+    kLivoxLidarTypeMid360 = 9
+    kLivoxLidarTypeIndustrialHAP = 10
+    kLivoxLidarTypeHAP = 15
+    kLivoxLidarTypePA = 16
+
+
+class LivoxLidarDeviceAck:
+    fmt = '<BB16s4sH'
+
+    def __init__(self, ret_code, dev_type, sn, lidar_ip, cmd_port):
+        self.ret_code = ret_code
+        self.dev_type = dev_type
+        self.sn = sn
+        self.lidar_ip = lidar_ip
+        self.cmd_port = cmd_port
+
+    def pack(self):
+        return struct.pack(self.fmt, self.ret_code, self.dev_type, self.sn[:16], struct.pack("!L", self.lidar_ip), self.cmd_port)
+
+    @classmethod
+    def unpack(cls, buffer):
+        ret_code, dev_type, sn, lidar_ip_packed, cmd_port = struct.unpack(cls.fmt, buffer)
+        sn = sn.decode('utf-8').rstrip('\x00')
+        lidar_ip = struct.unpack("!L", socket.inet_ntoa(lidar_ip_packed).encode('utf-8'))[0]
+        return cls(ret_code, dev_type, sn, lidar_ip, cmd_port)
+
+
+class LivoxLidarParamInquire:
+    def __init__(self, key_num, key_list):
+        self.key_num = key_num
+        self.key_list = key_list
+
+    @staticmethod
+    def unpack(buffer):
+        key_num, = struct.unpack_from('<H', buffer, 0)
+        key_list = []
+        offset = 4
+        for _ in range(key_num):
+            key, = struct.unpack_from('<H', buffer, offset)
+            key_list.append(key)
+            offset += 2
+        return LivoxLidarParamInquire(key_num, key_list)
+
+
+class LivoxLidarParamInquireAck:
+    fmt = "BHH"
+
+    def __init__(self, ret_code, key_num, key_value_list):
+        self.ret_code = ret_code
+        self.key_num = key_num
+        self.key_value_list = key_value_list
+
+    def pack(self):
+        return struct.pack(self.fmt, self.ret_code, self.key_num, self.key_value_list)
+
+
+class LivoxLidarParamConfig:
+    fmt = "HH"
+
+    def __init__(self, key_num, rsvd, key_list):
+        self.key_num = key_num
+        self.rsvd = rsvd
+        self.key_list = key_list
+
+    def pack(self):
+        return struct.pack(self.fmt, self.key_num, self.rsvd) + b''.join([param.pack() for param in self.key_list])
+
+    @classmethod
+    def unpack(cls, data):
+        key_num, rsvd = struct.unpack(cls.fmt, data[:struct.calcsize(cls.fmt)])
+        key_list = []
+        offset = struct.calcsize(cls.fmt)
+        for _ in range(key_num):
+            param = LivoxLidarKeyValueParam.unpack(data[offset:])
+            key_list.append(param)
+            offset += struct.calcsize(LivoxLidarKeyValueParam.fmt) + param.length
+        return cls(key_num, rsvd, key_list)
+
+
+class ParamKeyName(Enum):
+    kKeyPclDataType = 0x0000
+    kKeyPatternMode = 0x0001
+    kKeyDualEmitEn = 0x0002
+    kKeyPointSendEn = 0x0003
+    kKeyLidarIpCfg = 0x0004
+    kKeyStateInfoHostIpCfg = 0x0005
+    kKeyLidarPointDataHostIpCfg = 0x0006
+    kKeyLidarImuHostIpCfg = 0x0007
+    kKeyCtlHostIpCfg = 0x0008
+    kKeyLogHostIpCfg = 0x0009
+    kKeyVehicleSpeed = 0x0010
+    kKeyEnvironmentTemp = 0x0011
+    kKeyInstallAttitude = 0x0012
+    kKeyBlindSpotSet = 0x0013
+    kKeyFrameRate = 0x0014
+    kKeyFovCfg0 = 0x0015
+    kKeyFovCfg1 = 0x0016
+    kKeyFovCfgEn = 0x0017
+    kKeyDetectMode = 0x0018
+    kKeyFuncIoCfg = 0x0019
+    kKeyWorkModeAfterBoot = 0x0020
+    kKeyWorkMode = 0x001A
+    kKeyGlassHeat = 0x001B
+    kKeyImuDataEn = 0x001C
+    kKeyFusaEn = 0x001D
+    kKeyForceHeatEn = 0x001E
+    kKeyLogParamSet = 0x7FFF
+    kKeySn = 0x8000
+    kKeyProductInfo = 0x8001
+    kKeyVersionApp = 0x8002
+    kKeyVersionLoader = 0x8003
+    kKeyVersionHardware = 0x8004
+    kKeyMac = 0x8005
+    kKeyCurWorkState = 0x8006
+    kKeyCoreTemp = 0x8007
+    kKeyPowerUpCnt = 0x8008
+    kKeyLocalTimeNow = 0x8009
+    kKeyLastSyncTime = 0x800A
+    kKeyTimeOffset = 0x800B
+    kKeyTimeSyncType = 0x800C
+    kKeyStatusCode = 0x800D
+    kKeyLidarDiagStatus = 0x800E
+    kKeyLidarFlashStatus = 0x800F
+    kKeyFwType = 0x8010
+    kKeyHmsCode = 0x8011
+    kKeyCurGlassHeatState = 0x8012
+    kKeyRoiMode = 0xFFFE
+    kKeyLidarDiagInfoQuery = 0xFFFF
+
+
+class LivoxLidarAsyncControlResponse:
+    fmt = "BH"
+
+    def __init__(self, ret_code, error_key):
+        self.ret_code = ret_code
+        self.error_key = error_key
+
+    def pack(self):
+        return struct.pack(self.fmt, self.ret_code, self.error_key)
+
+    @classmethod
+    def unpack(cls, data):
+        return cls(*struct.unpack(cls.fmt, data[:struct.calcsize(cls.fmt)]))
+
+
+class LivoxLidarKeyValueParam:
+    fmt = "HH"
+
+    def __init__(self, key, length, value):
+        self.key = key
+        self.length = length
+        self.value = value
+
+    def pack(self):
+        return struct.pack(self.fmt, self.key, self.length) + self.value
+
+    @classmethod
+    def unpack(cls, data):
+        if len(data) < struct.calcsize(cls.fmt):
+            raise ValueError("Data too short to unpack header")
+        key, length = struct.unpack(cls.fmt, data[:struct.calcsize(cls.fmt)])
+        if len(data) < struct.calcsize(cls.fmt) + length:
+            raise ValueError("Data too short to unpack value")
+        value = data[struct.calcsize(cls.fmt):struct.calcsize(cls.fmt) + length]
+        return cls(key, length, value)
+
+class LivoxLidarEthernetPacket:
+    fmt = '<BHHHHBBB12sLQ'
+
+    def __init__(self, version, length, time_interval, dot_num, udp_cnt, frame_cnt, data_type, time_type, rsvd, crc32, timestamp, data):
+        self.version = version & 0xFF
+        self.length = length
+        self.time_interval = time_interval
+        self.dot_num = dot_num
+        self.udp_cnt = udp_cnt
+        self.frame_cnt = frame_cnt & 0xFF
+        self.data_type = data_type & 0xFF
+        self.time_type = time_type & 0xFF
+        self.rsvd = rsvd
+        self.crc32 = crc32
+        self.timestamp = timestamp
+        self.data = data
+
+    def pack(self):
+        header = struct.pack(self.fmt, self.version, self.length, self.time_interval, self.dot_num, self.udp_cnt, self.frame_cnt, self.data_type, self.time_type, self.rsvd, self.crc32, self.timestamp)
+        #return header + self.data
+        return header 
+
+    @classmethod
+    def unpack(cls, buffer):
+        header_size = struct.calcsize(cls.fmt)
+        header = buffer[:header_size]
+        data = buffer[header_size:]
+        unpacked_data = struct.unpack(cls.fmt, header)
+        return cls(*unpacked_data, data)
+
+
+class LivoxLidarCmdPacket:
+    fmt = '<BBHLHBB6sHL'
+
+    def __init__(self, sof, version, length, seq_num, cmd_id, cmd_type, sender_type, rsvd, crc16_h, crc32_d, data):
+        self.sof = sof
+        self.version = version
+        self.length = length
+        self.seq_num = seq_num
+        self.cmd_id = cmd_id
+        self.cmd_type = cmd_type
+        self.sender_type = sender_type
+        self.rsvd = rsvd
+        self.crc16_h = crc16_h
+        self.crc32_d = crc32_d
+        self.data = data
+
+    def pack(self):
+        header = struct.pack(self.fmt, self.sof, self.version, self.length, self.seq_num, self.cmd_id, self.cmd_type, self.sender_type, self.rsvd, self.crc16_h, self.crc32_d)
+        return header + self.data
+
+    @staticmethod
+    def unpack(buffer):
+        if len(buffer) < struct.calcsize(LivoxLidarCmdPacket.fmt):
+            raise ValueError(f"Buffer too short to unpack: length {len(buffer)}")
+        unpacked = struct.unpack_from(LivoxLidarCmdPacket.fmt, buffer)
+        data = buffer[struct.calcsize(LivoxLidarCmdPacket.fmt):]
+        return LivoxLidarCmdPacket(*unpacked, data)
+        
+class LivoxLidarCartesianHighRawPoint:
+    fmt = "iiiBB"
+
+    def __init__(self, x, y, z, reflectivity, tag=0):
+        self.x = x
+        self.y = y
+        self.z = z
+        self.reflectivity = reflectivity
+        self.tag = tag
+
+    def pack(self):
+        return struct.pack(self.fmt, self.x, self.y, self.z, self.reflectivity, self.tag)
+
+    @classmethod
+    def unpack(cls, data):
+        unpacked_data = struct.unpack(cls.fmt, data[:struct.calcsize(cls.fmt)])
+        return cls(*unpacked_data)
+
+
+class LivoxLidarCartesianLowRawPoint:
+    fmt = '<hhhBB'  # Ensure little-endian format with 'hhhBB'
+
+    def __init__(self, x, y, z, reflectivity, tag):
+        self.x = x
+        self.y = y
+        self.z = z
+        self.reflectivity = reflectivity
+        self.tag = tag
+
+    def pack(self):
+        # Ensure the values are within the valid range for 'h' and 'B'
+        x = max(-32768, min(32767, self.x))
+        y = max(-32768, min(32767, self.y))
+        z = max(-32768, min(32767, self.z))
+        reflectivity = max(0, min(255, self.reflectivity))  # reflectivity should be within 0-255 range
+        return struct.pack(self.fmt, x, y, z, reflectivity, self.tag)
+
+    @classmethod
+    def unpack(cls, buffer):
+        unpacked_data = struct.unpack(cls.fmt, buffer)
+        return cls(*unpacked_data)
+
+    def __str__(self):
+        return f"({self.x}, {self.y}, {self.z}, :{self.reflectivity}, :{self.tag})"
+
+class LivoxLidarIMURawData:
+        fmt = '<ffffff'  # six float values: gyro_x, gyro_y, gyro_z, acc_x, acc_y, acc_z
+
+        def __init__(self, gyro_x, gyro_y, gyro_z, acc_x, acc_y, acc_z):
+            self.gyro_x = gyro_x
+            self.gyro_y = gyro_y
+            self.gyro_z = gyro_z
+            self.acc_x = acc_x
+            self.acc_y = acc_y
+            self.acc_z = acc_z
+
+        def pack(self):
+            # Packing the IMU data into a binary format for UDP transmission
+            return struct.pack(self.fmt, self.gyro_x, self.gyro_y, self.gyro_z, self.acc_x, self.acc_y, self.acc_z)
+
+        @classmethod
+        def unpack(cls, data):
+            # Unpack binary data back into IMU data values
+            values = struct.unpack(cls.fmt, data[:struct.calcsize(cls.fmt)])
+            return cls(*values)
+
+
+
+
+class ip_mask_gw_info:
+    fmt = '!III'
+
+    def __init__(self, ip, mask, gateway):
+        self.ip = ip
+        self.mask = mask
+        self.gateway = gateway
+
+    def pack(self):
+        return struct.pack(self.fmt, self.ip, self.mask, self.gateway)
+
+    @classmethod
+    def unpack(cls, buffer):
+        return cls(*struct.unpack(cls.fmt, buffer))
+
+
+class ip_ports_info:
+    fmt = 'IHH'
+
+    def __init__(self, dest_ip, dest_port, src_port):
+        self.dest_ip = dest_ip
+        self.dest_port = dest_port
+        self.src_port = src_port
+
+
+    def pack(self):
+        packed_data = struct.pack(self.fmt, self.dest_ip, self.dest_port, self.src_port)
+        return packed_data
+
+    @classmethod
+    def unpack(cls, buffer):
+        dest_ip, dest_port, src_port = struct.unpack(cls.fmt, buffer)
+        return cls(dest_ip, dest_port, src_port)
+
+class LivoxLidarInstallAttitude:
+    fmt = 'fffIII'
+
+    def __init__(self, roll_deg, pitch_deg, yaw_deg, x_mm, y_mm, z_mm):
+        self.roll_deg = roll_deg
+        self.pitch_deg = pitch_deg
+        self.yaw_deg = yaw_deg
+        self.x_mm = x_mm
+        self.y_mm = y_mm
+        self.z_mm = z_mm
+
+    def pack(self):
+        return struct.pack(self.fmt, self.roll_deg, self.pitch_deg, self.yaw_deg, self.x_mm, self.y_mm, self.z_mm)
+
+    @classmethod
+    def unpack(cls, buffer):
+        return cls(*struct.unpack(cls.fmt, buffer))
+
+
+class FovCfg:
+    fmt = 'iiiiI'
+
+    def __init__(self, yaw_start, yaw_stop, pitch_start, pitch_stop, rsvd):
+        self.yaw_start = yaw_start
+        self.yaw_stop = yaw_stop
+        self.pitch_start = pitch_start
+        self.pitch_stop = pitch_stop
+        self.rsvd = rsvd
+
+    def pack(self):
+        return struct.pack(self.fmt, self.yaw_start, self.yaw_stop, self.pitch_start, self.pitch_stop, self.rsvd)
+
+    @classmethod
+    def unpack(cls, buffer):
+        return cls(*struct.unpack(cls.fmt, buffer))
+
+
+class DirectLidarStateInfo:
+    fmt = (
+        'BBBB'     # pcl_data_type, pattern_mode, dual_emit_en, point_send_en
+        'III'      # lidar_ipcfg
+        'IHH'      # host_info
+        'IHH'      # pointcloud_host_ipcfg
+        'IHH'      # imu_host_ipcfg
+        '16sHH'    # ctl_host_ipcfg (16s for ip_addr, 2H for ports)
+        '16sHH'    # log_host_ipcfg (16s for ip_addr, 2H for ports)
+        'ii'       # vehicle_speed, environment_temp
+        'fffiii'   # install_attitude
+        'I'        # blind_spot_set
+        'B'        # frame_rate
+        'iiiiI'    # fov_cfg0
+        'iiiiI'    # fov_cfg1
+        'B'        # fov_cfg_en
+        'B'        # detect_mode
+        '4B'       # func_io_cfg
+        'B'        # work_tgt_mode
+        'B'        # glass_heat
+        'B'        # imu_data_en
+        'B'        # fusa_en
+        '16s'      # sn
+        '64s'      # product_info
+        '4B'       # version_app
+        '4B'       # version_loader
+        '4B'       # version_hardware
+        '6B'       # mac
+        'B'        # cur_work_state
+        'i'        # core_temp
+        'I'        # powerup_cnt
+        'Q'        # local_time_now
+        'Q'        # last_sync_time
+        'q'        # time_offset
+        'B'        # time_sync_type
+        '32B'      # status_code
+        'H'        # lidar_diag_status
+        'B'        # lidar_flash_status
+        'B'        # fw_type
+        '8I'       # hms_code
+        'B'        # ROI_Mode
+    )
+
+    def __init__(self):
+        self.pcl_data_type = 0x01
+        self.pattern_mode = 0x00
+        self.dual_emit_en = 0x00
+        self.point_send_en = 0x00
+        self.lidar_ipcfg = ip_mask_gw_info(
+            struct.unpack("!I", socket.inet_aton(LIDAR_DEVICE_IP))[0],
+            struct.unpack("!I", socket.inet_aton(LIDAR_DEVICE_MASK))[0],
+            struct.unpack("!I", socket.inet_aton(LIDAR_DEVICE_GATEWAY))[0]
+        )
+        self.host_info = ip_ports_info(
+            struct.unpack("I", socket.inet_aton(LIDAR_HOST_IP))[0],
+            56201,  # Correct port for push_cmd_port_host
+            56200   # Correct port for push_cmd_port_device
+        )
+        self.pointcloud_host_ipcfg = ip_ports_info(
+            struct.unpack("I", socket.inet_aton(LIDAR_HOST_IP))[0],
+            56301,  # Correct port for point_data_port_host
+            56300   # Correct port for point_data_port_device
+        )
+        self.imu_host_ipcfg = ip_ports_info(
+            struct.unpack("I", socket.inet_aton(LIDAR_HOST_IP))[0],
+            56401,  # Correct port for imu_data_port_host
+            56400   # Correct port for imu_data_port_device
+        )
+        self.ctl_host_ipcfg = (LIDAR_HOST_IP.encode('utf-8'), 56501, 56500)  # Correct ports for log_data_port_host and log_data_port_device
+        self.log_host_ipcfg = (LIDAR_HOST_IP.encode('utf-8'), 56501, 56500)  # Correct ports for log_data_port_host and log_data_port_device
+        self.vehicle_speed = 0
+        self.environment_temp = 0
+        self.install_attitude = LivoxLidarInstallAttitude(0.0, 0.0, 0.0, 0, 0, 0)
+        self.blind_spot_set = 0
+        self.frame_rate = 0x00
+        self.fov_cfg0 = FovCfg(0, 360, -10, 60, 0)
+        self.fov_cfg1 = FovCfg(0, 360, -10, 60, 0)
+        self.fov_cfg_en = 0x03
+        self.detect_mode = 0x00
+        self.func_io_cfg = [0x00] * 4
+        self.work_tgt_mode = 0x01
+        self.glass_heat = 0x00
+        self.imu_data_en = 0x01
+        self.fusa_en = 0x00
+        self.sn = LIDAR_DEVICE_SN.encode('utf-8')
+        self.product_info = "Livox Lidar Mid-360 2021/12/01".encode('utf-8')
+        self.version_app = [0x01, 0x02, 0x03, 0x04]
+        self.version_loader = [0x01, 0x02, 0x03, 0x04]
+        self.version_hardware = [0x01, 0x02, 0x03, 0x04]
+        self.mac = list(DEVICE_MAC)
+        self.cur_work_state = 0x01
+        self.core_temp = 30
+        self.powerup_cnt = 10
+        self.local_time_now = 3875213548323846324
+        self.last_sync_time = 3875213548323846320
+        self.time_offset = 4
+        self.time_sync_type = 2
+        self.status_code = [0x00] * 32
+        self.lidar_diag_status = 0x0000
+        self.lidar_flash_status = 0x00
+        self.fw_type = 0x01
+        self.hms_code = [0x00] * 8
+        self.ROI_Mode = 0x00
+
+    def print_info(self):
+        print("IP:", self.pointcloud_host_ipcfg.dest_ip)
+        print("Dest Port:", self.pointcloud_host_ipcfg.dest_port)
+        print("Src Port:", self.pointcloud_host_ipcfg.src_port)
+        print("suiii")
+        #print("IP:", self.ctl_host_ipcfg.dest_ip)
+        print("Dest Port:", self.host_info.dest_port)
+        print("Src Port:", self.host_info.src_port)
+        pass
+
+
+    def pack(self):
+        return (
+            struct.pack(
+                'BBBB',
+                self.pcl_data_type,
+                self.pattern_mode,
+                self.dual_emit_en,
+                self.point_send_en,
+            )
+            + self.lidar_ipcfg.pack()
+            + self.host_info.pack()
+            + self.pointcloud_host_ipcfg.pack()
+            + self.imu_host_ipcfg.pack()
+            + struct.pack('16sHH', *self.ctl_host_ipcfg)
+            + struct.pack('16sHH', *self.log_host_ipcfg)
+            + struct.pack('ii', self.vehicle_speed, self.environment_temp)
+            + self.install_attitude.pack()
+            + struct.pack('I', self.blind_spot_set)
+            + struct.pack('B', self.frame_rate)
+            + self.fov_cfg0.pack()
+            + self.fov_cfg1.pack()
+            + struct.pack('B', self.fov_cfg_en)
+            + struct.pack('B', self.detect_mode)
+            + struct.pack('4B', *self.func_io_cfg)
+            + struct.pack('B', self.work_tgt_mode)
+            + struct.pack('B', self.glass_heat)
+            + struct.pack('B', self.imu_data_en)
+            + struct.pack('B', self.fusa_en)
+            + struct.pack('16s', self.sn)
+            + struct.pack('64s', self.product_info)
+            + struct.pack('4B', *self.version_app)
+            + struct.pack('4B', *self.version_loader)
+            + struct.pack('4B', *self.version_hardware)
+            + struct.pack('6B', *self.mac)
+            + struct.pack('B', self.cur_work_state)
+            + struct.pack('i', self.core_temp)
+            + struct.pack('I', self.powerup_cnt)
+            + struct.pack('Q', self.local_time_now)
+            + struct.pack('Q', self.last_sync_time)
+            + struct.pack('q', self.time_offset)
+            + struct.pack('B', self.time_sync_type)
+            + struct.pack('32B', *self.status_code)
+            + struct.pack('H', self.lidar_diag_status)
+            + struct.pack('B', self.lidar_flash_status)
+            + struct.pack('B', self.fw_type)
+            + struct.pack('8I', *self.hms_code)
+            + struct.pack('B', self.ROI_Mode)
+            
+        )
+
+
+
+    
+
+    
+
+
+    def get_pcl_host_socket():
+        return pcl_host_socket
+    
+    def get_imu_host_socket():
+        return imu_host_socket
+
+    def setup_pcl_file_handle(filename):
+        global pcl_file
+        pcl_file = open(filename, 'r')
+        if pcl_file is None:
+            print(f"Failed to open file: {filename}")
+            return -1
+        for _ in range(11):
+            pcl_file.readline()
+        return 0
+
+    
+
+
+    
+
+
+    def error(msg):
+        print(f"Error: {msg}", file=sys.stderr)
+        sys.exit(1)
+
+class Pointcloud(BehaviorScript):
+    def on_init(self):
+        self.elapsetme = 0
+        self.delayedduration = 3
+        self.sensor = IMUSensor(
+            prim_path="/Vibrating_Part/Imu_Sensor",
+            name="imu",
+            frequency=60,
+            translation=np.array([0, 0, 0]),
+            orientation=np.array([1, 0, 0, 0]),
+            linear_acceleration_filter_size = 10,
+            angular_velocity_filter_size = 10,
+            orientation_filter_size = 10,
+        )
+       
+        
+        # set using frame number
+        
+
+        carb.log_info(f"{type(self).__name__}.on_init()->{self.prim_path}")
+
+    def on_destroy(self):
+        carb.log_info(f"{type(self).__name__}.on_destroy()->{self.prim_path}")
+
+    def on_play(self):
+        self.main()
+        # self.timeline = omni.timeline.get_timeline_interface()
+        self.render_product = rep.create.render_product("/Vibrating_Part/livox_mid360/livox_mid360_repetitive", [1, 1])
+        self.annotator = rep.AnnotatorRegistry.get_annotator("RtxSensorCpuIsaacCreateRTXLidarScanBuffer")
+
+        self.annotator.attach(self.render_product)
+        
+        # Create Annotator to read the data from with annotator.get_data()
+        
+       
+        carb.log_info(f"{type(self).__name__}.on_play()->{self.prim_path}")
+
+    def on_pause(self):
+        carb.log_info(f"{type(self).__name__}.on_pause()->{self.prim_path}")
+
+    def on_stop(self):
+        carb.log_info(f"{type(self).__name__}.on_stop()->{self.prim_path}")
+
+
+    
+
+    def on_update(self, current_time: float, delta_time: float):
+        global IMU_TARGET_DELTA_TIME
+        global POINTCLOUD_TARGET_DELTA_TIME
+        
+        print(delta_time)
+            # Check if the current delta_time is larger than the target rate
+        if delta_time >= IMU_TARGET_DELTA_TIME:
+            # Process IMU data only when the target delta_time is reached
+            # print(delta_time)
+            value = self.sensor.get_current_frame()
+            print("IMU Data : " , value)
+            self.IMU_Data_Callback(value)
+            
+        if delta_time >= POINTCLOUD_TARGET_DELTA_TIME:
+            # Process Point cloud data only when the target delta_time is reached
+           self.data = self.annotator.get_data()
+           
+           print("Point cloud Data : ", self.data["data"])
+           self.point_cloud_callback(self.data["data"])
+       
+        return
+        # carb.log_info(f"{type(self).__name__}.on_updateSAM({current_time}, {delta_time})->{self.prim_path}")
+
+    def main(self):
+        carb.log_info(f"{type(self).__name__}.on_playSAM()->{self.prim_path}")
+       
+        
+
+
+
+        self.init_livox_lidar_info_data()
+
+        # rospy.init_node('point_cloud_listener', anonymous=True)
+
+        t1 = threading.Thread(target=self.handle_command_protocol)
+        # t2 = threading.Thread(target=handle_pcl_data_from_file)       # Subscriber for point cloud
+        # print("shhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh")
+
+        t1.start()
+        
+        carb.log_info("Thread Started SAM")
+        # t2.start()
+
+
+
+        # try:
+        #     t1.join()
+        #     carb.log_info("Thread Joined SAM")
+        #     # t2.join()
+        # except KeyboardInterrupt:
+        #     print("Terminating main threads.")
+
+
+    def send_udp_message(self,message, target_ip, target_port):
+    # Create a UDP socket
+        # sock = []
+        
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        
+        try:
+            # Send message
+           
+            
+            sock.sendto(message, (target_ip, target_port))
+            # print(f"Sent message: '{message}' to {target_ip}:{target_port}")
+        finally:
+            sock.close()
+        
+        sock.close()
+       
+
+
+    def receive_udp_message(self,local_ip, local_port):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind((local_ip, local_port))
+        
+        print(f"Listening on SAM {local_ip}:{local_port} for UDP messages...")
+        
+        while True:
+            # Receive message
+            data, addr = sock.recvfrom(1024)  # Buffer size is 1024 bytes
+            print(f"Received message: SAM '{data.decode('utf-8')}' from {addr}")
+
+    def init_livox_lidar_info_data(self):
+        global g_lidar_info
+        g_lidar_info = DirectLidarStateInfo()
+
+    def handle_command_protocol(self):
+        sockets = []
+        print("shhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh")
+        print("shhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh")
+        print("shhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh")
+
+        print("shhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh")
+        print("shhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh")
+
+        print("shhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh")
+        print("shhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh")
+        print("shhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh")
+        print("shhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh")
+
+
+        sockets.append(self.create_lidar_udp_socket('0.0.0.0', broadcast_port, 1))
+        sockets.append(self.create_lidar_udp_socket(LIDAR_DEVICE_IP, ctrl_cmd_port_device, 0))
+
+        fds = []
+        for sock in sockets:
+            if sock is not None:
+                fds.append({'fd': sock, 'events': POLLIN})
+
+        poller = poll()
+        for fd in fds:
+            poller.register(fd['fd'], fd['events'])
+
+        try:
+            while True:
+                events = poller.poll()
+                print("aynnnnnnnnnnnnnnnnnnnnnnnnnn")
+                for fd, event in events:
+                    if event & POLLIN:
+                        sock = None
+                        for s in sockets:
+                            if s.fileno() == fd:
+                                sock = s
+                                break
+
+                        if sock is None:
+                            print(f"No matching socket found for fd {fd}")
+                            continue
+
+                        buffer = bytearray(MAXLEN)
+                        print("Sammmmmmm",buffer)
+                        n, client_address = sock.recvfrom_into(buffer)
+                        if n < 0:
+                            print(f"recvfrom error on socket {sock.fileno()}")
+                            continue
+
+                    # print(f"CLIENT IP ......{client_address[0]} PORT .............{client_address[1]}")
+
+                        pkt = LivoxLidarCmdPacket.unpack(buffer)
+                        cmd_type = pkt.cmd_type
+                        cmd_id = pkt.cmd_id
+                        print(f"command-id : {cmd_id}")
+                        #print(f"\n cmd_type 0x{cmd_type:x}, cmd_id= 0x{cmd_id:x} length {n}")
+
+                        if cmd_type == 0x00:
+                            if cmd_id == 0x0000:
+                                self.handle_device_type_query(sock, client_address, pkt)
+                            elif cmd_id == 0x0100:
+                                self.handle_parameter_configuration(sock, client_address, pkt)
+                            elif cmd_id == 0x0101:
+                                self.handle_parameter_inquire(sock, client_address, pkt)
+                            else:
+                                print(f"Unknown command ID: {cmd_id}")
+                        else:
+                            print(f"Unknown command type: {cmd_type}")
+        except KeyboardInterrupt:
+            print("Terminating handle_command_protocol.")
+        finally:
+            for sock in sockets:
+                sock.close()
+
+        return 0
+    
+    def create_lidar_udp_socket(self,s_addr, port, broadcast_enable=0):
+        try:
+            sockfd = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        except socket.error as err:
+            print(f"Socket creation failed on port {port}: {err}")
+            return None
+
+        if broadcast_enable:
+            try:
+                sockfd.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            except socket.error as err:
+                print(f"Set socket broadcast option failed on port {port}: {err}")
+                sockfd.close()
+                return None
+
+        try:
+            sockfd.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sockfd.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, MAXLEN)
+            sockfd.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, MAXLEN)
+            sockfd.bind((s_addr, port))
+        except socket.error as err:
+            print(f"Socket bind failed on port {port}: {err}")
+            sockfd.close()
+            return None
+
+        return sockfd
+    
+    def handle_device_type_query(self,sockfd, client_addr, req):
+        ack = LivoxLidarDeviceAck(0x00, LivoxLidarDeviceType.kLivoxLidarTypeMid360.value, LIDAR_DEVICE_SN.encode('utf-8'), struct.unpack("!L", socket.inet_aton(LIDAR_DEVICE_IP))[0], ctrl_cmd_port_device)
+        data = ack.pack()
+        response = LivoxLidarCmdPacket(req.sof, req.version, len(data) + 24, req.seq_num, 0x0000, 0x01, 0x01, req.rsvd, 0, 0, data)
+        response.crc16_h = self.calculate_crc16(response.pack()[:18])
+        response.crc32_d = self.calculate_crc32(response.pack()[24:])
+        packed_response = response.pack()
+        print("Response packet before sending:",{packed_response.hex()})
+        self.print_buffer(packed_response)
+        sockfd.sendto(packed_response, client_addr)
+    # print(f"Sent device type query response to {client_addr[0]}:{client_addr[1]}")
+
+    def handle_parameter_configuration(self,sockfd, client_addr, req):
+        print("heeeeeeeeeeeeeeeeeeeeeeeeee")
+        try:
+            kvp_list = []
+            data_ptr = 0
+            #print(f"Received data for configuration: {req.data.hex()}")
+
+            while data_ptr < len(req.data):
+                remaining_data = len(req.data) - data_ptr
+                expected_header_size = struct.calcsize(LivoxLidarKeyValueParam.fmt)
+
+                if remaining_data < expected_header_size:
+                    #print(f"Warning: Data too short to unpack header at position {data_ptr}. Remaining data length: {remaining_data}, expected header size: {expected_header_size}")
+                    break
+
+                key, length = struct.unpack(LivoxLidarKeyValueParam.fmt, req.data[data_ptr:data_ptr + expected_header_size])
+                data_ptr += expected_header_size
+
+                if length == 0:
+                    #print(f"Warning: Key {key} has a length of 0. Skipping this key.")
+                    continue
+
+                if remaining_data < expected_header_size + length:
+                    #print(f"Warning: Value too short to unpack for key {key} at position {data_ptr}. Expected length: {length}, remaining data length: {remaining_data - expected_header_size}")
+                    break
+
+                value = req.data[data_ptr:data_ptr + length]
+                data_ptr += length
+                kvp = LivoxLidarKeyValueParam(key, length, value)
+                kvp_list.append(kvp)
+                print(f"Unpacked Key: {key}, Length: {length}, Value: {value.hex()}")
+
+            for i, kvp in enumerate(kvp_list):
+                print(f"Setting key {i}: {kvp.key}, Value: {kvp.value.hex()}")
+                self.set_livox_lidar_info_data(kvp.key, kvp)
+
+            ack = struct.pack('<BH', 0x00, 0x0000)
+
+            response = LivoxLidarCmdPacket(req.sof, req.version, len(ack) + 24, req.seq_num, req.cmd_id, 0x01, 0x01, req.rsvd, 0, 0, ack)
+            response.crc16_h = self.calculate_crc16(response.pack()[:18])
+            response.crc32_d = self.calculate_crc32(response.pack()[24:])
+            packed_response = response.pack()
+
+            #print("Response packet before sending:")
+            self.print_buffer(packed_response)
+
+            sockfd.sendto(packed_response, client_addr)
+            print(f"Sent parameter configuration response to {client_addr[0]}:{client_addr[1]}")
+        except Exception as e:
+            print(f"Error in handle_parameter_configuration: {e}")
+            exit()
+
+    def handle_parameter_inquire(self,sockfd, client_addr, req):
+        try:
+            print("Received Parameter Inquire request with key list:")
+            response_buffer = bytearray(MAXLEN)
+            response = LivoxLidarCmdPacket(req.sof, req.version, 0, req.seq_num, req.cmd_id, 0x01, 0x01, req.rsvd, 0, 0, b'')
+            response_length = 24
+
+            key_num = struct.unpack_from('<H', req.data, 0)[0]
+            print(f"Number of keys: {key_num}")
+
+            ack = struct.pack('<BH', 0x00, key_num)
+            response_buffer[24:27] = ack
+            response_length += 3
+
+            key_list = req.data[4:4 + 2 * key_num]
+
+            for i in range(key_num):
+                key = struct.unpack_from('<H', key_list, i * 2)[0]
+                print(f"Key {i}: 0x{key:04x}")
+                kvp = self.get_livox_lidar_info_data(key)
+                if kvp is None:
+                    #print(f"Key {key} not supported or invalid.")
+                    ack = LivoxLidarParamInquireAck(0x01, 1, 0)  # Return an error response
+                    response_buffer[24:27] = ack.pack()
+                    response_length = 27
+                    break
+                kvp_packed = kvp.pack()
+                response_buffer[response_length:response_length + len(kvp_packed)] = kvp_packed
+                response_length += len(kvp_packed)
+
+                print(f"Packed Key-Value Pair {i}: ", end="")
+                self.print_buffer(kvp_packed)
+
+            response.data = response_buffer[24:response_length]
+            response.length = response_length
+            response.crc16_h = self.calculate_crc16(response.pack()[:18])
+            response.crc32_d = self.calculate_crc32(response.pack()[24:])
+            packed_response = response.pack()
+
+            #print("Response packet before sending:")
+            self.print_buffer(packed_response)
+
+            sockfd.sendto(packed_response, client_addr)
+            print(f"Sent parameter inquire response to {client_addr[0]}:{client_addr[1]}")
+        except Exception as e:
+            print(f"Error in handle_parameter_inquire: {e}")
+
+    def calculate_crc16(self, data):
+        crc = 0xFFFF
+        for byte in data:
+            crc ^= byte << 8
+            for _ in range(8):
+                if crc & 0x8000:
+                    crc = (crc << 1) ^ 0x1021
+                else:
+                    crc <<= 1
+        return crc & 0xFFFF
+    
+    def calculate_crc32(self,data):
+        crc = 0xFFFFFFFF
+        for i, b in enumerate(data):
+            crc ^= b
+            for _ in range(8):
+                if crc & 1:
+                    crc = (crc >> 1) ^ 0xEDB88320
+                else:
+                    crc >>= 1
+        final_crc = crc ^ 0xFFFFFFFF
+        return final_crc
+    
+    def set_livox_lidar_info_data(self,key, kvp):
+
+        print(f"Processing key: {key}, Value: {kvp.value.hex()}")
+        global g_lidar_info, pcl_sockfd
+
+        if key == ParamKeyName.kKeyPclDataType.value:
+            print("kKeyPclDataType .......................................")
+            if len(kvp.value) != 1:
+                raise ValueError(f"Expected length 1 for kKeyPclDataType, got {len(kvp.value)}")
+            g_lidar_info.pcl_data_type, = struct.unpack('B', kvp.value)
+
+        elif key == ParamKeyName.kKeyPatternMode.value:
+            print("kKeyPatternMode.......................................")
+            if len(kvp.value) != 1:
+                raise ValueError(f"Expected length 1 for kKeyPatternMode, got {len(kvp.value)}")
+            g_lidar_info.pattern_mode, = struct.unpack('B', kvp.value)
+
+        elif key == ParamKeyName.kKeyLidarIpCfg.value:
+            print("kKeyLidarIpCfg.......................................")
+            if len(kvp.value) != struct.calcsize(ip_mask_gw_info.fmt):
+                raise ValueError(f"Expected length {struct.calcsize(ip_mask_gw_info.fmt)} for kKeyLidarIpCfg, got {len(kvp.value)}")
+            g_lidar_info.lidar_ipcfg = ip_mask_gw_info.unpack(kvp.value)
+
+        elif key == ParamKeyName.kKeyStateInfoHostIpCfg.value:
+            print("kKeyStateInfoHostIpCfg.......................................")
+            if len(kvp.value) != struct.calcsize(ip_ports_info.fmt):
+                raise ValueError(f"Expected length {struct.calcsize(ip_ports_info.fmt)} for kKeyStateInfoHostIpCfg, got {len(kvp.value)}")
+            g_lidar_info.host_info = ip_ports_info.unpack(kvp.value)
+            dest_port = socket.ntohs(g_lidar_info.host_info.dest_port)
+            src_port = socket.ntohs(g_lidar_info.host_info.src_port)
+            self.print_ipcfg(g_lidar_info.host_info.dest_ip, dest_port, src_port)
+
+        elif key == ParamKeyName.kKeyLidarPointDataHostIpCfg.value:
+            print("kKeyLidarPointDataHostIpCfg.......................................")
+            if len(kvp.value) != struct.calcsize(ip_ports_info.fmt):
+                raise ValueError(f"Expected length {struct.calcsize(ip_ports_info.fmt)} for kKeyLidarPointDataHostIpCfg, got {len(kvp.value)}")
+            g_lidar_info.pointcloud_host_ipcfg = ip_ports_info.unpack(kvp.value)
+            dest_port = g_lidar_info.pointcloud_host_ipcfg.dest_port  # This is in network byte order
+            dest_ip = g_lidar_info.pointcloud_host_ipcfg.dest_ip
+            src_port = socket.ntohs(g_lidar_info.pointcloud_host_ipcfg.src_port)
+            print(f"POINT CLOUD DATA.......................................")
+            self.print_ipcfg(dest_ip, dest_port, src_port)
+            if not isinstance(dest_port, int):
+                raise ValueError(f"Expected integer for dest_port, got {type(dest_port)}")
+
+            if self.set_pcl_socket(dest_ip, dest_port):
+            # if set_pcl_socket(dest_ip, dest_port):
+                pass
+
+        elif key == ParamKeyName.kKeyLidarImuHostIpCfg.value:
+            print("kKeyLidarImuHostIpCfg.......................................")
+            if len(kvp.value) != struct.calcsize(ip_ports_info.fmt):
+                raise ValueError(f"Expected length {struct.calcsize(ip_ports_info.fmt)} for kKeyLidarImuHostIpCfg, got {len(kvp.value)}")
+            g_lidar_info.imu_host_ipcfg = ip_ports_info.unpack(kvp.value)
+            dest_port = g_lidar_info.imu_host_ipcfg.dest_port  # This is in network byte order
+            dest_ip = g_lidar_info.imu_host_ipcfg.dest_ip
+            src_port = socket.ntohs(g_lidar_info.imu_host_ipcfg.src_port)
+            
+            self.print_ipcfg(dest_ip, dest_port, src_port)
+
+            if self.set_imu_socket(dest_ip, dest_port):
+            # if set_pcl_socket(dest_ip, dest_port):
+                pass
+
+        elif key == ParamKeyName.kKeyInstallAttitude.value:
+            print("kKeyInstallAttitude.......................................")
+            if len(kvp.value) != struct.calcsize(LivoxLidarInstallAttitude.fmt):
+                raise ValueError(f"Expected length {struct.calcsize(LivoxLidarInstallAttitude.fmt)} for kKeyInstallAttitude, got {len(kvp.value)}")
+            g_lidar_info.install_attitude = LivoxLidarInstallAttitude.unpack(kvp.value)
+
+        elif key == ParamKeyName.kKeyFovCfg0.value:
+            print("kKeyFovCfg0.......................................")
+            if len(kvp.value) != struct.calcsize(FovCfg.fmt):
+                raise ValueError(f"Expected length {struct.calcsize(FovCfg.fmt)} for kKeyFovCfg0, got {len(kvp.value)}")
+            g_lidar_info.fov_cfg0 = FovCfg.unpack(kvp.value)
+
+        elif key == ParamKeyName.kKeyFovCfg1.value:
+            print("kKeyFovCfg1.......................................")
+            if len(kvp.value) != struct.calcsize(FovCfg.fmt):
+                raise ValueError(f"Expected length {struct.calcsize(FovCfg.fmt)} for kKeyFovCfg1, got {len(kvp.value)}")
+            g_lidar_info.fov_cfg1 = FovCfg.unpack(kvp.value)
+
+        elif key == ParamKeyName.kKeyFovCfgEn.value:
+            print("kKeyFovCfgEn.......................................")
+            if len(kvp.value) != 1:
+                raise ValueError(f"Expected length 1 for kKeyFovCfgEn, got {len(kvp.value)}")
+            g_lidar_info.fov_cfg_en, = struct.unpack('B', kvp.value)
+
+        elif key == ParamKeyName.kKeyDetectMode.value:
+            print("kKeyDetectMode.......................................")
+            if len(kvp.value) != 1:
+                raise ValueError(f"Expected length 1 for kKeyDetectMode, got {len(kvp.value)}")
+            g_lidar_info.detect_mode, = struct.unpack('B', kvp.value)
+
+        elif key == ParamKeyName.kKeyFuncIoCfg.value:
+            print("kKeyFuncIoCfg.......................................")
+            g_lidar_info.func_io_cfg = list(kvp.value)
+
+        elif key == ParamKeyName.kKeyWorkMode.value:
+            print("kKeyWorkMode.......................................")
+            if len(kvp.value) != 1:
+                raise ValueError(f"Expected length 1 for kKeyWorkMode, got {len(kvp.value)}")
+            g_lidar_info.work_tgt_mode, = struct.unpack('B', kvp.value)
+
+        elif key == ParamKeyName.kKeyImuDataEn.value:
+            print("kKeyImuDataEn.......................................")
+            if len(kvp.value) != 1:
+                raise ValueError(f"Expected length 1 for kKeyImuDataEn, got {len(kvp.value)}")
+            g_lidar_info.imu_data_en, = struct.unpack('B', kvp.value)
+
+        elif key == ParamKeyName.kKeySn.value:
+            print("kKeySn.......................................")
+            g_lidar_info.sn = kvp.value
+
+        elif key == ParamKeyName.kKeyProductInfo.value:
+            print("kKeyProductInfo.......................................")
+            g_lidar_info.product_info = kvp.value
+
+        elif key == ParamKeyName.kKeyVersionApp.value:
+            print("kKeyVersionApp.......................................")
+            if len(kvp.value) != 4:
+                raise ValueError(f"Expected length 4 for kKeyVersionApp, got {len(kvp.value)}")
+            g_lidar_info.version_app = list(kvp.value)
+
+        elif key == ParamKeyName.kKeyVersionLoader.value:
+            print("kKeyVersionLoader.......................................")
+            if len(kvp.value) != 4:
+                raise ValueError(f"Expected length 4 for kKeyVersionLoader, got {len(kvp.value)}")
+            g_lidar_info.version_loader = list(kvp.value)
+
+        elif key == ParamKeyName.kKeyVersionHardware.value:
+            print("kKeyVersionHardware.......................................")
+            if len(kvp.value) != 4:
+                raise ValueError(f"Expected length 4 for kKeyVersionHardware, got {len(kvp.value)}")
+            g_lidar_info.version_hardware = list(kvp.value)
+
+        elif key == ParamKeyName.kKeyMac.value:
+            print("kKeyMac.......................................")
+            if len(kvp.value) != 6:
+                raise ValueError(f"Expected length 6 for kKeyMac, got {len(kvp.value)}")
+            g_lidar_info.mac = list(kvp.value)
+
+        elif key == ParamKeyName.kKeyCurWorkState.value:
+            print("kKeyCurWorkState.......................................")
+            if len(kvp.value) != 1:
+                raise ValueError(f"Expected length 1 for kKeyCurWorkState, got {len(kvp.value)}")
+            g_lidar_info.cur_work_state, = struct.unpack('B', kvp.value)
+
+        elif key == ParamKeyName.kKeyCoreTemp.value:
+            print("kKeyCoreTemp.......................................")
+            if len(kvp.value) != 4:
+                raise ValueError(f"Expected length 4 for kKeyCoreTemp, got {len(kvp.value)}")
+            g_lidar_info.core_temp, = struct.unpack('i', kvp.value)
+
+        elif key == ParamKeyName.kKeyPowerUpCnt.value:
+            print("kKeyPowerUpCnt.......................................")
+            if len(kvp.value) != 4:
+                raise ValueError(f"Expected length 4 for kKeyPowerUpCnt, got {len(kvp.value)}")
+            g_lidar_info.powerup_cnt, = struct.unpack('I', kvp.value)
+
+        elif key == ParamKeyName.kKeyLocalTimeNow.value:
+            print("kKeyLocalTimeNow.......................................")
+            if len(kvp.value) != 8:
+                raise ValueError(f"Expected length 8 for kKeyLocalTimeNow, got {len(kvp.value)}")
+            g_lidar_info.local_time_now, = struct.unpack('Q', kvp.value)
+
+        elif key == ParamKeyName.kKeyLastSyncTime.value:
+            print("kKeyLastSyncTime.......................................")
+            if len(kvp.value) != 8:
+                raise ValueError(f"Expected length 8 for kKeyLastSyncTime, got {len(kvp.value)}")
+            g_lidar_info.last_sync_time, = struct.unpack('Q', kvp.value)
+
+        elif key == ParamKeyName.kKeyTimeOffset.value:
+            print("kKeyTimeOffset.......................................")
+            if len(kvp.value) != 8:
+                raise ValueError(f"Expected length 8 for kKeyTimeOffset, got {len(kvp.value)}")
+            g_lidar_info.time_offset, = struct.unpack('q', kvp.value)
+
+        elif key == ParamKeyName.kKeyTimeSyncType.value:
+            print("kKeyTimeSyncType.......................................")
+            if len(kvp.value) != 1:
+                raise ValueError(f"Expected length 1 for kKeyTimeSyncType, got {len(kvp.value)}")
+            g_lidar_info.time_sync_type, = struct.unpack('B', kvp.value)
+
+        elif key == ParamKeyName.kKeyLidarDiagStatus.value:
+            print("kKeyLidarDiagStatus.......................................")
+            if len(kvp.value) != 2:
+                raise ValueError(f"Expected length 2 for kKeyLidarDiagStatus, got {len(kvp.value)}")
+            g_lidar_info.lidar_diag_status, = struct.unpack('H', kvp.value)
+
+        elif key == ParamKeyName.kKeyFwType.value:
+            print("kKeyFwType.......................................")
+            if len(kvp.value) != 1:
+                raise ValueError(f"Expected length 1 for kKeyFwType, got {len(kvp.value)}")
+            g_lidar_info.fw_type, = struct.unpack('B', kvp.value)
+
+        elif key == ParamKeyName.kKeyHmsCode.value:
+            print("kKeyHmsCode.......................................")
+            if len(kvp.value) != 32:
+                raise ValueError(f"Expected length 32 for kKeyHmsCode, got {len(kvp.value)}")
+            g_lidar_info.hms_code = list(struct.unpack('8I', kvp.value))
+
+
+    def get_livox_lidar_info_data(self,key):
+        kvp = None
+        try:
+            
+            if key == ParamKeyName.kKeyPclDataType.value:
+                kvp = LivoxLidarKeyValueParam(key, 1, struct.pack('B', g_lidar_info.pcl_data_type))
+            elif key == ParamKeyName.kKeyPatternMode.value:
+                kvp = LivoxLidarKeyValueParam(key, 1, struct.pack('B', g_lidar_info.pattern_mode))
+            elif key == ParamKeyName.kKeyLidarIpCfg.value:
+                kvp = LivoxLidarKeyValueParam(key, struct.calcsize(ip_mask_gw_info.fmt), g_lidar_info.lidar_ipcfg.pack())
+            elif key == ParamKeyName.kKeyStateInfoHostIpCfg.value:
+                kvp = LivoxLidarKeyValueParam(key, struct.calcsize(ip_ports_info.fmt), g_lidar_info.host_info.pack())
+            elif key == ParamKeyName.kKeyLidarPointDataHostIpCfg.value:           
+                kvp = LivoxLidarKeyValueParam(key, struct.calcsize(ip_ports_info.fmt), g_lidar_info.pointcloud_host_ipcfg.pack())
+            elif key == ParamKeyName.kKeyLidarImuHostIpCfg.value:
+                kvp = LivoxLidarKeyValueParam(key, struct.calcsize(ip_ports_info.fmt), g_lidar_info.imu_host_ipcfg.pack())
+            elif key == ParamKeyName.kKeyInstallAttitude.value:
+                kvp = LivoxLidarKeyValueParam(key, struct.calcsize(LivoxLidarInstallAttitude.fmt), g_lidar_info.install_attitude.pack())
+            elif key == ParamKeyName.kKeyFovCfg0.value:
+                kvp = LivoxLidarKeyValueParam(key, struct.calcsize(FovCfg.fmt), g_lidar_info.fov_cfg0.pack())
+            elif key == ParamKeyName.kKeyFovCfg1.value:
+                kvp = LivoxLidarKeyValueParam(key, struct.calcsize(FovCfg.fmt), g_lidar_info.fov_cfg1.pack())
+            elif key == ParamKeyName.kKeyFovCfgEn.value:
+                kvp = LivoxLidarKeyValueParam(key, 1, struct.pack('B', g_lidar_info.fov_cfg_en))
+            elif key == ParamKeyName.kKeyDetectMode.value:
+                kvp = LivoxLidarKeyValueParam(key, 1, struct.pack('B', g_lidar_info.detect_mode))
+            elif key == ParamKeyName.kKeyFuncIoCfg.value:
+                kvp = LivoxLidarKeyValueParam(key, len(g_lidar_info.func_io_cfg), bytes(g_lidar_info.func_io_cfg))
+            elif key == ParamKeyName.kKeyWorkMode.value:
+                kvp = LivoxLidarKeyValueParam(key, 1, struct.pack('B', g_lidar_info.work_tgt_mode))
+            elif key == ParamKeyName.kKeyImuDataEn.value:
+                kvp = LivoxLidarKeyValueParam(key, 1, struct.pack('B', g_lidar_info.imu_data_en))
+            elif key == ParamKeyName.kKeySn.value:
+                sn_padded = g_lidar_info.sn.ljust(16, b'\x00')  # Ensure it is padded to 16 bytes
+                kvp = LivoxLidarKeyValueParam(key, 16, sn_padded)
+            elif key == ParamKeyName.kKeyProductInfo.value:
+                product_info_padded = g_lidar_info.product_info + b'\x00' * (64 - len(g_lidar_info.product_info))
+                kvp = LivoxLidarKeyValueParam(key, 64, product_info_padded)
+            elif key == ParamKeyName.kKeyVersionApp.value:
+                kvp = LivoxLidarKeyValueParam(key, 4, bytes(g_lidar_info.version_app))
+            elif key == ParamKeyName.kKeyVersionLoader.value:
+                kvp = LivoxLidarKeyValueParam(key, 4, bytes(g_lidar_info.version_loader))
+            elif key == ParamKeyName.kKeyVersionHardware.value:
+                kvp = LivoxLidarKeyValueParam(key, 4, bytes(g_lidar_info.version_hardware))
+            elif key == ParamKeyName.kKeyMac.value:
+                kvp = LivoxLidarKeyValueParam(key, 6, bytes(g_lidar_info.mac))
+            elif key == ParamKeyName.kKeyCurWorkState.value:
+                kvp = LivoxLidarKeyValueParam(key, 1, struct.pack('B', g_lidar_info.cur_work_state))
+            elif key == ParamKeyName.kKeyCoreTemp.value:
+                kvp = LivoxLidarKeyValueParam(key, 4, struct.pack('i', g_lidar_info.core_temp))
+            elif key == ParamKeyName.kKeyPowerUpCnt.value:
+                kvp = LivoxLidarKeyValueParam(key, 4, struct.pack('I', g_lidar_info.powerup_cnt))
+            elif key == ParamKeyName.kKeyLocalTimeNow.value:
+                kvp = LivoxLidarKeyValueParam(key, 8, struct.pack('Q', g_lidar_info.local_time_now))
+            elif key == ParamKeyName.kKeyLastSyncTime.value:
+                kvp = LivoxLidarKeyValueParam(key, 8, struct.pack('Q', g_lidar_info.last_sync_time))
+            elif key == ParamKeyName.kKeyTimeOffset.value:
+                kvp = LivoxLidarKeyValueParam(key, 8, struct.pack('q', g_lidar_info.time_offset))
+            elif key == ParamKeyName.kKeyTimeSyncType.value:
+                kvp = LivoxLidarKeyValueParam(key, 1, struct.pack('B', g_lidar_info.time_sync_type))
+            elif key == ParamKeyName.kKeyLidarDiagStatus.value:
+                kvp = LivoxLidarKeyValueParam(key, 2, struct.pack('H', g_lidar_info.lidar_diag_status))
+            elif key == ParamKeyName.kKeyFwType.value:
+                try:
+                    print(f"FW Type: {g_lidar_info.fw_type}")  # Add this line
+                    fw_type_packed = struct.pack('B', g_lidar_info.fw_type)
+                    kvp = LivoxLidarKeyValueParam(key, len(fw_type_packed), fw_type_packed)
+                except Exception as e:
+                    print(f"Error processing kKeyFwType: {str(e)}")
+                    kvp = None
+            elif key == ParamKeyName.kKeyHmsCode.value:
+                kvp = LivoxLidarKeyValueParam(key, 32, struct.pack('8I', *g_lidar_info.hms_code))
+            if kvp is not None:
+                #print(f"get_livox_lidar_info_data: Key {key}, Length {kvp.length}, Value {kvp.value.hex()}")
+                pass
+            else:
+                print(f"get_livox_lidar_info_data: Key {key} not found or unsupported.")
+        except struct.error as e:
+            print(f"Struct error in get_livox_lidar_info_data: {e}")
+        except Exception as e:
+            print(f"Error in get_livox_lidar_info_data: {e}")
+
+        return kvp
+    
+    def print_buffer(self,buf):
+        length = len(buf)
+        for i in range(length):
+            if i % 16 == 0:
+                print()
+            if i % 4 == 0:
+                print(" ", end="")
+            if buf[i] > 9:
+                print(f"{buf[i]:02x}", end="")
+            elif buf[i]:
+                print(f"0{buf[i]:x}", end="")
+            else:
+                print("00", end="")
+        print()
+        return length
+    
+    original_ip = None
+
+    def set_imu_socket(self,ip_addr, pcl_port_host):
+        global imu_sockfd, imu_host_socket, original_ip
+
+        if imu_sockfd is not None:
+            print(f"Closing existing socket with descriptor: {imu_sockfd}")
+            imu_sockfd.close()
+            imu_sockfd = None
+
+        try:
+            imu_sockfd = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            if imu_sockfd.fileno() < 0:
+                raise socket.error(f"Error creating socket. IP: {ip_addr} port: {pcl_port_host}")
+            print(f"IMU Socket created successfully. Descriptor: {imu_sockfd.fileno()}")
+            print(f"IMU set_pcl_socket...............IP ADDR : {ip_addr} PORT : {pcl_port_host}")
+        except socket.error as e:
+            print(f"Error creating socket. IP: {ip_addr} port: {pcl_port_host} Error: {e}")
+            return 0
+
+        if isinstance(ip_addr, int):
+            ip_addr = socket.inet_ntoa(struct.pack('!I', ip_addr))
+
+        imu_host_socket = (ip_addr, int(pcl_port_host))
+        original_ip = ip_addr  # Store the original IP address
+
+        device_addr = (LIDAR_DEVICE_IP, imu_data_port_device)
+
+        print(f"IMU Binding to device address - IP: {LIDAR_DEVICE_IP} Port: {imu_data_port_device}")
+
+        try:
+            imu_sockfd.bind(device_addr)
+            print(f"IMU Socket successfully bound. Descriptor: {imu_sockfd.fileno()}")
+        except socket.error as e:
+            print(f"Error binding to port {imu_data_port_device} Error: {e}")
+            imu_sockfd.close()
+            imu_sockfd = None
+            return 0
+
+        return imu_sockfd
+
+    def set_pcl_socket(self,ip_addr, pcl_port_host):
+        global pcl_sockfd, pcl_host_socket, original_ip
+
+        if pcl_sockfd is not None:
+            print(f"Closing existing socket with descriptor: {pcl_sockfd}")
+            pcl_sockfd.close()
+            pcl_sockfd = None
+
+        try:
+            pcl_sockfd = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            if pcl_sockfd.fileno() < 0:
+                raise socket.error(f"Error creating socket. IP: {ip_addr} port: {pcl_port_host}")
+            print(f"Socket created successfully. Descriptor: {pcl_sockfd.fileno()}")
+            print(f"set_pcl_socket...............IP ADDR : {ip_addr} PORT : {pcl_port_host}")
+        except socket.error as e:
+            print(f"Error creating socket. IP: {ip_addr} port: {pcl_port_host} Error: {e}")
+            return 0
+
+        if isinstance(ip_addr, int):
+            ip_addr = socket.inet_ntoa(struct.pack('!I', ip_addr))
+
+        pcl_host_socket = (ip_addr, int(pcl_port_host))
+        original_ip = ip_addr  # Store the original IP address
+
+        device_addr = (LIDAR_DEVICE_IP, point_data_port_device)
+
+        print(f"Binding to device address - IP: {LIDAR_DEVICE_IP} Port: {point_data_port_device}")
+
+        try:
+            pcl_sockfd.bind(device_addr)
+            print(f"Socket successfully bound. Descriptor: {pcl_sockfd.fileno()}")
+        except socket.error as e:
+            print(f"Error binding to port {point_data_port_device} Error: {e}")
+            pcl_sockfd.close()
+            pcl_sockfd = None
+            return 0
+
+        return pcl_sockfd
+    
+    def print_ipcfg(self,ip, dest, src):
+        
+        if not isinstance(ip, int):
+            raise ValueError(f"IP must be an integer, got {type(ip)}")
+
+        ip_str = socket.inet_ntoa(struct.pack('!I', ip))
+
+    def process_points_in_batches(self,points,frame_cnt, batch_size=96):
+        # Process and send points in batches
+        check =0
+        for i in range(0, len(points), batch_size):
+            batch = points[i:i+batch_size] 
+            
+            print(f"Batch  {i} send...") # Get a chunk of 96 points (or less if remaining points are fewer than 96)
+            self.send_points(batch,frame_cnt)
+            print("supppppppppppppppppppppppppppppppppppppppppp")
+           
+            # check = check +1
+            # if check > :
+            #     exit(1)
+
+
+
+    
+
+    def IMU_Data_Callback(self,data):
+        # global frame_cnt
+        # frame_cnt = (frame_cnt +1) %256
+        self.SendIMU(data)
+
+
+
+
+    def SendIMU(self, IMU):
+        global buffer2, seq_num1, frame_cnt
+        frame_cnt = (frame_cnt + 1) % 256# Increment frame counter, wrapping around at 256# Create IMU Data
+        imu_data = LivoxLidarIMURawData(
+            gyro_x=float(IMU["ang_vel"][0]),
+            gyro_y=float(IMU["ang_vel"][1]),
+            gyro_z=float(IMU["ang_vel"][2]),
+            acc_x=float(IMU["lin_acc"][0]),
+            acc_y=float(IMU["lin_acc"][1]),
+            acc_z=float(IMU["lin_acc"][2])
+        )
+ 
+        # Pack the IMU data
+        imu_data_packed = imu_data.pack()
+ 
+        # Define the Ethernet Packet
+        packet = LivoxLidarEthernetPacket(
+            version=0,
+            length=len(imu_data_packed) + struct.calcsize(LivoxLidarEthernetPacket.fmt),
+            time_interval=0,
+            dot_num=0,
+            udp_cnt=seq_num1,
+            frame_cnt=frame_cnt,
+            data_type=0,  # Set according to Livox protocol
+            time_type=0,
+            rsvd=b'\x00' * 12,
+            crc32=0,
+            timestamp=int(time.time() * 1e6),  # microsecond timestamp
+            data=imu_data_packed
+        )
+ 
+        # Pack the Ethernet packet header
+        packet_header = packet.pack()
+    
+        # Calculate CRC32 for data section and set it
+        crc32_value = self.calculate_crc32(imu_data_packed)
+        packet.crc32 = crc32_value
+        packet_with_crc = packet.pack()  # Update the packet header with CRC# Combine header and data
+        full_packet = packet_with_crc + imu_data_packed
+        
+            # Send the IMU data via the socket
+        if self.send_imu_data(full_packet, len(full_packet)) < 0:
+            print("Error sending IMU data")
+            buffer2.clear()
+            return
+        print(f"IMU Data sent successfully for sequence number: {seq_num1}")
+        # seq_num1 += 1
+        seq_num1 = (seq_num1 + 1) % 65536
+
+    # def SendIMU(self, IMU):
+        
+    #      # global buffer
+    #     local_buffer1 = bytearray()
+    #     save_buffer_start = bytes(buffer2)  # Create a copy to compute CRC later
+    #     resp_buffer_len1 = 0
+    #     dot_num = 0
+    #     timestamp = [0]
+    #     global seq_num1
+    #     len1 = struct.calcsize(LivoxLidarEthernetPacket.fmt)
+    #     resp_buffer_len1 += len1
+    #     print("Len ",len1)
+
+    #     x_mm = float(1)
+    #     y_mm = float(2)
+    #     z_mm = float(3)
+
+    #     roll_deg = float(4)
+    #     pitch_deg = float(5)
+    #     yaw_deg = float(6)
+
+    #     print("ROLL",roll_deg," ",pitch_deg , " ",yaw_deg)
+
+
+    #     point_obj = LivoxLidarIMURawData(roll_deg, pitch_deg, yaw_deg, x_mm, y_mm, z_mm)
+    #     packed_point = point_obj.pack()
+    #     # # print(packed_point.hex())
+    #     len1 =  len(packed_point)
+    #     resp_buffer_len1 += len1
+    #     print("ROLL" ,len1)
+        
+    #     local_buffer1.extend(packed_point)
+
+    #     packet = LivoxLidarEthernetPacket(
+    #         version=0,
+    #         length=resp_buffer_len1,
+    #         time_interval=0,
+    #         dot_num=dot_num,
+    #         udp_cnt=seq_num1,
+    #         frame_cnt=frame_cnt,
+    #         data_type=2,
+    #         time_type=0,
+    #         rsvd=b'\x00' * 12,
+    #         crc32=0,
+    #         timestamp=23875872534872,
+    #         data=local_buffer1
+    #     )
+    #     packed_packet = packet.pack()
+
+    #     temp = bytearray()
+    #     temp = packed_packet + local_buffer1
+    #     hex_data = temp[28:resp_buffer_len1].hex()
+    #     crc32_value = self.calculate_crc32(bytes.fromhex(hex_data))
+    #     packet.crc32 = crc32_value
+    #     packed_packet = packet.pack()
+
+    #     buffer2.extend(packed_packet)
+    #     buffer2.extend(local_buffer1)
+    #     # print(buffer.hex())
+    #     # print(len(buffer))
+    #     # print("shamileeeeeeeeeeeeee")
+    #     # print("shamileeeeeeeeeeeeee")
+    #     # print("shamileeeeeeeeeeeeee")
+    #     # print("shamileeeeeeeeeeeeee")
+        
+
+
+    #     # # Send point cloud data to the device
+    #     print(f"SAM Sending IMU data for sequence number: {seq_num} with buffer length: {resp_buffer_len1}")
+    #     if self.send_imu_data(buffer2, resp_buffer_len1) < 0:
+    #         buffer2.clear()
+    #         local_buffer1.clear()
+    #         print("Error sending message to device")
+    #         return
+
+    #     print(f"SAM IMU Data sent successfully for sequence number: {seq_num}")
+    #     buffer2.clear()
+    #     local_buffer1.clear()
+    #     #seq_num += 1
+    #     seq_num1 = (seq_num1 + 1) % 65536
+        
+
+
+    def point_cloud_callback(self,points):
+        print("suiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii")
+        global frame_cnt
+        frame_cnt = (frame_cnt +1) %256
+        
+    # Extract the point cloud data from the message
+        # points = pc2.read_points(msg, field_names=("x", "y", "z",), skip_nans=True)
+        #rospy.loginfo(f"Available fields: {msg.fields}")    # Added just for Debug Shubham
+        points_list = list(points)
+        # num_points = len(points_list) / 96
+
+        # rospy.loginfo(f"number of points in the message : {num_points}")
+        # Print point cloud data (x, y, z)
+        # rospy.loginfo("Received PointCloud2 data:")
+        count = 0
+        self.process_points_in_batches(points_list, frame_cnt)
+
+    #shamil-point cloud data
+
+    def send_points(self ,points,frame_cnt):
+        # Function to send the points (you can customize this part)
+        print(f"Sending {len(points)} points...")
+        # global buffer
+        local_buffer = bytearray()
+        save_buffer_start = bytes(buffer)  # Create a copy to compute CRC later
+        resp_buffer_len = 0
+        dot_num = 0
+        timestamp = [0]
+        global seq_num
+        len1 = struct.calcsize(LivoxLidarEthernetPacket.fmt)
+        for point in points:
+            resp_buffer_len += len1
+            x, y, z = point[:3]
+            # intensity = 0
+            # Convert to integer values and pack the point data
+            try:
+                x_int = int(x*100)
+                y_int = int(y*100)
+                z_int = int(z*100)
+                intensity_int = 1
+            except ValueError:
+                continue  # Skip invalid points
+
+            # # Increment static_time for the timestamp
+            # static_time = getattr(point_cloud_callback, "static_time", 0)
+            # if static_time == 0:
+            #     static_time = timestamp[0]
+            #     setattr(point_cloud_callback, "static_time", static_time)
+            # else:
+            #     static_time += 480765
+            #     setattr(point_cloud_callback, "static_time", static_time)
+            # timestamp[0] = static_time
+
+            point_obj = LivoxLidarCartesianLowRawPoint(x_int, y_int, z_int, intensity_int, 0)
+            packed_point = point_obj.pack()
+            len1 =  len(packed_point)
+            local_buffer.extend(packed_point)
+          
+            dot_num += 1
+
+            # if dot_num >= POINTCLOUDDATAMAX:
+                
+            #     break
+            
+        # Packet creation and packing
+        packet = LivoxLidarEthernetPacket(
+            version=0,
+            length=resp_buffer_len,
+            time_interval=0,
+            dot_num=dot_num,
+            udp_cnt=seq_num,
+            frame_cnt=frame_cnt,
+            data_type=2,
+            time_type=0,
+            rsvd=b'\x00' * 12,
+            crc32=0,
+            timestamp=23875872534872,
+            data=local_buffer
+        )
+        packed_packet = packet.pack()
+
+        temp = bytearray()
+        temp = packed_packet + local_buffer
+        hex_data = temp[28:resp_buffer_len].hex()
+        crc32_value = self.calculate_crc32(bytes.fromhex(hex_data))
+        packet.crc32 = crc32_value
+        packed_packet = packet.pack()
+        buffer.extend(packed_packet)
+        buffer.extend(local_buffer)
+    
+
+        # Send point cloud data to the device
+        print(f"Sending point cloud data for sequence number: {seq_num} with buffer length: {resp_buffer_len}")
+        if self.send_pcl_data(buffer, resp_buffer_len) < 0:
+            buffer.clear()
+            local_buffer.clear()
+            print("Error sending message to device")
+            return
+
+        print(f"Data sent successfully for sequence number: {seq_num}")
+        buffer.clear()
+        local_buffer.clear()
+        seq_num = (seq_num + 1) % 65536
+
+        # for point in points:
+        #     print(point) 
+
+
+    def send_pcl_data(self,buffer2, length):
+        global pcl_sockfd, pcl_host_socket, original_ip
+        if pcl_sockfd is None or pcl_sockfd.fileno() <= 0:
+            print(f"Invalid socket descriptor: {pcl_sockfd}")
+            return -1
+        correct_port = point_data_port_host
+
+        # Temporarily reverse the IP address
+        reversed_ip = socket.inet_ntoa(socket.inet_aton(pcl_host_socket[0])[::-1])
+        pcl_host_socket = (reversed_ip, correct_port)
+
+        try:
+            bytes_sent = pcl_sockfd.sendto(buffer2[:length], pcl_host_socket)
+            # print(buffer2[:length].hex())
+        except socket.error as e:
+            print(f"Error sending message to host. Error: {e}")
+            return -1
+
+        if bytes_sent < 0:
+            print("Error sending message to host")
+            return -1
+        else:
+            print(f"Sent {bytes_sent} bytes to host")
+
+        # Reset the IP address to the original
+        pcl_host_socket = (original_ip, correct_port)
+        return bytes_sent
+    
+    # IMU Data
+    def send_imu_data(self,buffer2, length):
+        global imu_sockfd, imu_host_socket, original_ip
+        if imu_sockfd is None or imu_sockfd.fileno() <= 0:
+            print(f"Invalid socket descriptor: {imu_sockfd}")
+            return -1
+        correct_port = imu_data_port_host
+
+        # Temporarily reverse the IP address
+        reversed_ip = socket.inet_ntoa(socket.inet_aton(imu_host_socket[0])[::-1])
+        imu_host_socket = (reversed_ip, correct_port)
+
+        try:
+            bytes_sent = imu_sockfd.sendto(buffer2[:length], imu_host_socket)
+            # print(buffer2[:length].hex())
+        except socket.error as e:
+            print(f"Error sending message to host. Error: {e}")
+            return -1
+
+        if bytes_sent < 0:
+            print("Error sending message to host")
+            return -1
+        else:
+            print(f"IMU Data Sent {bytes_sent} bytes to host")
+
+        # Reset the IP address to the original
+        imu_host_socket = (original_ip, correct_port)
+        return bytes_sent
+    
+    
